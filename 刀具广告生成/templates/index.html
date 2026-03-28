@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KnifeAd Pro — AI 刀具广告批量生成</title>
+    <meta name="description" content="AI 驱动的刀具广告批量生成工具，一键将多把刀具融入多个场景。">
+    <link rel="stylesheet" href="/static/style.css">
+    <link rel="icon"
+        href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔪</text></svg>">
+</head>
+
+<body>
+
+    <!-- Header -->
+    <header class="header">
+        <div class="header-inner">
+            <div class="logo">
+                <div class="logo-icon">🔪</div>
+                <span class="logo-text">KnifeAd Pro</span>
+            </div>
+            <span class="header-badge">批量生成 · Powered by Gemini</span>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="main">
+
+        <!-- Step 1: Upload Knives -->
+        <section class="section">
+            <div class="card">
+                <h2 class="card-title">
+                    <span class="step-num">1</span>
+                    <span>上传刀具图</span>
+                    <span class="step-hint">支持多选，批量上传</span>
+                </h2>
+                <div class="knife-upload-zone" id="knife-upload-zone">
+                    <input type="file" id="knife-input" accept="image/*" multiple hidden>
+                    <div class="upload-placeholder" id="knife-placeholder">
+                        <div class="upload-icon">🔪</div>
+                        <div class="upload-label">拖拽或点击上传刀具产品图</div>
+                        <div class="upload-hint">支持 PNG / JPG，可一次选择多张</div>
+                    </div>
+                </div>
+                <div class="knife-previews" id="knife-previews"></div>
+            </div>
+        </section>
+
+        <!-- Step 2: Configure Scenes -->
+        <section class="section">
+            <div class="card">
+                <h2 class="card-title">
+                    <span class="step-num">2</span>
+                    <span>配置场景任务</span>
+                    <span class="step-hint">每个场景可使用不同背景和 Prompt</span>
+                </h2>
+
+                <!-- Category Manager -->
+                <div class="category-manager">
+                    <div class="presets-bar-label">管理自定义分类：</div>
+                    <div class="category-manager-inner">
+                        <div class="category-manager-tags" id="category-manager-tags">
+                            <!-- Tags will be rendered here -->
+                        </div>
+                        <div class="category-add-form">
+                            <input type="text" id="new-category-name" placeholder="输入分类名 (如: 削皮刀)">
+                            <button class="category-add-btn" id="category-add-btn">＋ 添加</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Quick Presets -->
+                <div class="presets-bar">
+                    <span class="presets-bar-label">快速添加预设场景：</span>
+                    <div class="presets-chips" id="presets-chips"></div>
+                </div>
+
+                <!-- Scene Tasks List -->
+                <div class="scene-list" id="scene-list">
+                    <!-- Dynamically added scene cards -->
+                </div>
+
+                <button class="add-scene-btn" id="add-scene-btn">
+                    <span>＋</span> 添加自定义场景
+                </button>
+            </div>
+        </section>
+
+        <!-- Step 3: Generate -->
+        <section class="section">
+            <div class="card">
+                <h2 class="card-title">
+                    <span class="step-num">3</span>
+                    <span>批量生成</span>
+                </h2>
+                <div class="generate-summary" id="generate-summary">
+                    请先上传刀具图并配置场景任务
+                </div>
+                <button class="generate-btn" id="generate-btn" disabled>
+                    <span>⚡</span> 开始批量生成
+                </button>
+
+                <!-- Progress -->
+                <div class="progress-section" id="progress-section" style="display:none">
+                    <div class="progress-bar-wrap">
+                        <div class="progress-bar" id="progress-bar"></div>
+                    </div>
+                    <div class="progress-text" id="progress-text">准备中...</div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Results Gallery -->
+        <section class="section" id="results-section" style="display:none">
+            <div class="card">
+                <h2 class="card-title">
+                    <span class="icon">🖼️</span>
+                    <span>生成结果</span>
+                    <button class="download-all-btn" id="download-all-btn">⬇️ 全部下载</button>
+                </h2>
+                <div class="results-grid" id="results-grid"></div>
+                <div class="errors-list" id="errors-list"></div>
+            </div>
+        </section>
+
+    </main>
+
+    <!-- Loading Overlay -->
+    <div class="loading-overlay" id="loading-overlay">
+        <div class="loader"></div>
+        <div class="loading-text" id="loading-text">AI 正在批量生成广告图...</div>
+        <div class="loading-progress" id="loading-progress"></div>
+    </div>
+
+    <!-- Toast Container -->
+    <div class="toast-container" id="toast-container"></div>
+
+    <script src="/static/app.js"></script>
+</body>
+
+</html>
