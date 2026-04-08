@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from gemini_client import generate_ad_image_bytes
+from gemini_client import generate_ad_image_bytes, generate_ad_image_bytes_combo
 from config import SCENES, ASSETS_DIR
 
 app = Flask(__name__)
@@ -115,6 +115,7 @@ def batch_generate():
         prompt = scene.get("prompt", "").strip()
         scene_name = scene.get("name", "unknown")
         selected_cats = scene.get("selected_categories", [])
+        combo_mode = scene.get("combo_mode", False)
 
         if not prompt:
             continue
@@ -134,32 +135,68 @@ def batch_generate():
         if bg_img is None:
             continue
 
-        for idx, knife_img in enumerate(knife_images):
-            # 获取配置
-            knife_cat = "general"
-            knife_comp = ""
-            if idx < len(knives_metadata):
-                knife_cat = knives_metadata[idx].get("category", "general")
-                knife_comp = knives_metadata[idx].get("composition", "")
+        if combo_mode:
+            # 组合模式：将所有匹配的刀具作为一个列表传递
+            matched_knives = []
+            matched_knife_names = []
+            matched_compositions = []
+            for idx, knife_img in enumerate(knife_images):
+                # 获取配置
+                knife_cat = "general"
+                knife_comp = ""
+                if idx < len(knives_metadata):
+                    knife_cat = knives_metadata[idx].get("category", "general")
+                    knife_comp = knives_metadata[idx].get("composition", "")
 
-            # 分类过滤器
-            if selected_cats and knife_cat not in selected_cats:
-                continue
+                # 分类过滤器
+                if selected_cats and knife_cat not in selected_cats:
+                    continue
 
-            task_list.append({
-                "knife_img": knife_img,
-                "knife_name": knife_names[idx],
-                "bg_img": bg_img,
-                "prompt": prompt,
-                "composition": knife_comp,
-                "scene_name": scene_name,
-            })
+                matched_knives.append(knife_img)
+                matched_knife_names.append(knife_names[idx])
+                matched_compositions.append(knife_comp)
+
+            if matched_knives:
+                task_list.append({
+                    "knife_imgs": matched_knives,
+                    "knife_names": matched_knife_names,
+                    "bg_img": bg_img,
+                    "prompt": prompt,
+                    "compositions": matched_compositions,
+                    "scene_name": scene_name,
+                    "combo_mode": True
+                })
+        else:
+            # 单刀模式：每个刀具算一个任务
+            for idx, knife_img in enumerate(knife_images):
+                # 获取配置
+                knife_cat = "general"
+                knife_comp = ""
+                if idx < len(knives_metadata):
+                    knife_cat = knives_metadata[idx].get("category", "general")
+                    knife_comp = knives_metadata[idx].get("composition", "")
+
+                # 分类过滤器
+                if selected_cats and knife_cat not in selected_cats:
+                    continue
+
+                task_list.append({
+                    "knife_img": knife_img,
+                    "knife_name": knife_names[idx],
+                    "bg_img": bg_img,
+                    "prompt": prompt,
+                    "composition": knife_comp,
+                    "scene_name": scene_name,
+                    "combo_mode": False
+                })
 
     if not task_list:
         return jsonify({"success": False, "error": "没有有效的生成任务"}), 400
 
     # 创建批量任务
     task_id = str(uuid.uuid4())[:8]
+    # 创建取消事件
+    cancel_event = threading.Event()
     with tasks_lock:
         tasks[task_id] = {
             "status": "running",
@@ -167,30 +204,69 @@ def batch_generate():
             "completed": 0,
             "results": [],
             "errors": [],
+            "cancel_event": cancel_event
         }
 
     # 后台线程处理
     def process_batch():
         for item in task_list:
-            label = f"{item['scene_name']}_{item['knife_name']}"
-            try:
-                success, result = generate_ad_image_bytes(
-                    item["bg_img"], item["knife_img"], item["prompt"], item.get("composition", "")
-                )
-                with tasks_lock:
-                    tasks[task_id]["completed"] += 1
-                    if success:
-                        b64 = base64.b64encode(result).decode("utf-8")
-                        tasks[task_id]["results"].append({
-                            "label": label,
-                            "image": b64,
-                        })
-                    else:
-                        tasks[task_id]["errors"].append(f"{label}: {result}")
-            except Exception as e:
-                with tasks_lock:
-                    tasks[task_id]["completed"] += 1
-                    tasks[task_id]["errors"].append(f"{label}: {str(e)}")
+            # 检查是否取消
+            with tasks_lock:
+                current_task = tasks.get(task_id)
+                if not current_task:
+                    break
+                cancel_event = current_task.get("cancel_event")
+                if cancel_event and cancel_event.is_set():
+                    break
+            
+            if item.get("combo_mode", False):
+                # 组合模式
+                label = f"{item['scene_name']}_combo"
+                try:
+                    success, result = generate_ad_image_bytes_combo(
+                        item["bg_img"], item["knife_imgs"], item["prompt"], item.get("compositions", []),
+                        cancel_event=cancel_event
+                    )
+                    with tasks_lock:
+                        tasks[task_id]["completed"] += 1
+                        if success:
+                            b64 = base64.b64encode(result).decode("utf-8")
+                            tasks[task_id]["results"].append({
+                                "label": label,
+                                "image": b64,
+                                "composition": item.get("composition", ""),
+                                "compositions": item.get("compositions", [])
+                            })
+                        else:
+                            tasks[task_id]["errors"].append(f"{label}: {result}")
+                except Exception as e:
+                    with tasks_lock:
+                        tasks[task_id]["completed"] += 1
+                        tasks[task_id]["errors"].append(f"{label}: {str(e)}")
+            else:
+                # 单刀模式
+                label = f"{item['scene_name']}_{item['knife_name']}"
+                try:
+                    success, result = generate_ad_image_bytes(
+                        item["bg_img"], item["knife_img"], item["prompt"], item.get("composition", ""),
+                        cancel_event=cancel_event
+                    )
+                    with tasks_lock:
+                        tasks[task_id]["completed"] += 1
+                        if success:
+                            b64 = base64.b64encode(result).decode("utf-8")
+                            tasks[task_id]["results"].append({
+                                "label": label,
+                                "image": b64,
+                                "composition": item.get("composition", ""),
+                                "compositions": item.get("compositions", [])
+                            })
+                        else:
+                            tasks[task_id]["errors"].append(f"{label}: {result}")
+                except Exception as e:
+                    with tasks_lock:
+                        tasks[task_id]["completed"] += 1
+                        tasks[task_id]["errors"].append(f"{label}: {str(e)}")
 
         with tasks_lock:
             tasks[task_id]["status"] = "done"
@@ -223,5 +299,25 @@ def task_status(task_id):
     })
 
 
+@app.route("/api/task_cancel/<task_id>", methods=["POST"])
+def task_cancel(task_id):
+    """取消批量任务"""
+    with tasks_lock:
+        task = tasks.get(task_id)
+    if not task:
+        return jsonify({"success": False, "error": "任务不存在"}), 404
+    
+    if task["status"] == "done":
+        return jsonify({"success": False, "error": "任务已完成"}), 400
+    
+    # 设置取消事件
+    cancel_event = task.get("cancel_event")
+    if cancel_event:
+        cancel_event.set()
+        task["status"] = "cancelled"
+    
+    return jsonify({"success": True, "message": "任务已取消"})
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, debug=True)
+    app.run(host="localhost", port=3000, debug=True)

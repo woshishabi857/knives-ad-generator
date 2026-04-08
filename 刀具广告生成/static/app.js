@@ -27,7 +27,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const loadingOverlay = document.getElementById('loading-overlay');
     const loadingText = document.getElementById('loading-text');
     const loadingProgress = document.getElementById('loading-progress');
+    const cancelBtn = document.getElementById('cancel-btn');
     const toastContainer = document.getElementById('toast-container');
+
+    // 当前任务 ID
+    let currentTaskId = null;
 
     // Category Manager refs
     const categoryManagerTags = document.getElementById('category-manager-tags');
@@ -36,7 +40,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // State
     let knifeFiles = [];       // [{file, dataUrl, category, composition}]
-    let sceneCards = [];        // [{id, type, presetKey?, bgFile?, bgDataUrl?, prompt, name, selectedCategories}]
+    let sceneCards = [];        // [{id, type, presetKey?, bgFile?, bgDataUrl?, prompt, name, selectedCategories, enabled, comboMode}]
     let presetsData = [];       // from API
     let allResults = [];        // [{label, image}]
     let sceneIdCounter = 0;
@@ -147,6 +151,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const reader = new FileReader();
             reader.onload = (ev) => {
                 knifeFiles.push({ file, dataUrl: ev.target.result, category: 'general', composition: '' });
+                saveSavedKnives();
                 renderKnifePreviews();
                 updateSummary();
             };
@@ -178,17 +183,20 @@ document.addEventListener('DOMContentLoaded', () => {
             thumb.querySelector('.remove-x').addEventListener('click', (e) => {
                 e.stopPropagation();
                 knifeFiles.splice(idx, 1);
+                saveSavedKnives();
                 renderKnifePreviews();
                 updateSummary();
             });
             // Category change
             thumb.querySelector('.knife-category-select').addEventListener('change', (e) => {
                 item.category = e.target.value;
+                saveSavedKnives();
                 updateSummary();
             });
             // Composition change
             thumb.querySelector('.knife-composition-input').addEventListener('input', (e) => {
                 item.composition = e.target.value;
+                saveSavedKnives();
             });
             knifePreviews.appendChild(thumb);
         });
@@ -226,6 +234,8 @@ document.addEventListener('DOMContentLoaded', () => {
             name: preset.name,
             selectedCategories: [preset.key], // Default to its own category
             bgDataUrl: preset.thumbnail ? `data:image/jpeg;base64,${preset.thumbnail}` : null,
+            enabled: true,
+            comboMode: false
         });
         renderScenes();
         updateSummary();
@@ -242,7 +252,9 @@ document.addEventListener('DOMContentLoaded', () => {
             bgDataUrl: null,
             prompt: '',
             name: `自定义场景 ${id}`,
-            selectedCategories: [] // Default empty (means all)
+            selectedCategories: [], // Default empty (means all)
+            enabled: true,
+            comboMode: false
         });
         renderScenes();
         updateSummary();
@@ -265,7 +277,17 @@ document.addEventListener('DOMContentLoaded', () => {
                     <div class="scene-card-name">
                         <input type="text" value="${escapeHtml(scene.name)}" data-field="name">
                     </div>
-                    <button class="scene-remove-btn" title="删除">✕</button>
+                    <div class="scene-card-controls">
+                        <label class="toggle-switch">
+                            <input type="checkbox" data-field="enabled" ${scene.enabled ? 'checked' : ''}>
+                            <span class="toggle-slider"></span>
+                        </label>
+                        <label class="toggle-switch">
+                            <input type="checkbox" data-field="comboMode" ${scene.comboMode ? 'checked' : ''}>
+                            <span class="toggle-slider"></span>
+                        </label>
+                        <button class="scene-remove-btn" title="删除">✕</button>
+                    </div>
                 </div>
                 <div class="scene-card-body">
                     ${isPreset && scene.bgDataUrl
@@ -287,6 +309,14 @@ document.addEventListener('DOMContentLoaded', () => {
                                 </div>
                             `).join('')}
                         </div>
+                        <div class="scene-mode-indicators">
+                            <span class="mode-indicator">
+                                <strong>状态：</strong>${scene.enabled ? '启用' : '禁用'}
+                            </span>
+                            <span class="mode-indicator">
+                                <strong>模式：</strong>${scene.comboMode ? '组合模式' : '单刀模式'}
+                            </span>
+                        </div>
                     </div>
                 </div>
             `;
@@ -306,6 +336,20 @@ document.addEventListener('DOMContentLoaded', () => {
             // Prompt edit
             card.querySelector('textarea[data-field="prompt"]').addEventListener('input', (e) => {
                 scene.prompt = e.target.value;
+                updateSummary();
+            });
+
+            // Enabled toggle
+            card.querySelector('input[data-field="enabled"]').addEventListener('change', (e) => {
+                scene.enabled = e.target.checked;
+                renderScenes();
+                updateSummary();
+            });
+
+            // Combo Mode toggle
+            card.querySelector('input[data-field="comboMode"]').addEventListener('change', (e) => {
+                scene.comboMode = e.target.checked;
+                renderScenes();
                 updateSummary();
             });
 
@@ -352,17 +396,30 @@ document.addEventListener('DOMContentLoaded', () => {
         const validScenes = sceneCards.filter(s => {
             const hasPrompt = s.prompt.trim().length > 0;
             const hasBg = s.type === 'preset' ? !!s.presetKey : !!s.bgFile;
-            return hasPrompt && hasBg;
+            const isEnabled = s.enabled;
+            return hasPrompt && hasBg && isEnabled;
         });
         const sceneCount = validScenes.length;
 
         let totalTasks = 0;
         validScenes.forEach(s => {
-            const matchedKnives = knifeFiles.filter(k => {
-                if (s.selectedCategories.length === 0) return true;
-                return s.selectedCategories.includes(k.category);
-            });
-            totalTasks += matchedKnives.length;
+            if (s.comboMode) {
+                // 组合模式：每个场景算一个任务
+                const matchedKnives = knifeFiles.filter(k => {
+                    if (s.selectedCategories.length === 0) return true;
+                    return s.selectedCategories.includes(k.category);
+                });
+                if (matchedKnives.length > 0) {
+                    totalTasks += 1;
+                }
+            } else {
+                // 单刀模式：每个刀具算一个任务
+                const matchedKnives = knifeFiles.filter(k => {
+                    if (s.selectedCategories.length === 0) return true;
+                    return s.selectedCategories.includes(k.category);
+                });
+                totalTasks += matchedKnives.length;
+            }
         });
 
         if (knifeCount === 0) {
@@ -388,7 +445,8 @@ document.addEventListener('DOMContentLoaded', () => {
         const validScenes = sceneCards.filter(s => {
             const hasPrompt = s.prompt.trim().length > 0;
             const hasBg = s.type === 'preset' ? !!s.presetKey : !!s.bgFile;
-            return hasPrompt && hasBg;
+            const isEnabled = s.enabled;
+            return hasPrompt && hasBg && isEnabled;
         });
 
         if (knifeFiles.length === 0 || validScenes.length === 0) {
@@ -428,8 +486,15 @@ document.addEventListener('DOMContentLoaded', () => {
             prompt: s.prompt,
             name: s.name,
             selected_categories: s.selectedCategories,
+            combo_mode: s.comboMode
         }));
         formData.append('scenes', JSON.stringify(scenesPayload));
+
+        // 清空之前的结果
+        resultsSection.style.display = 'none';
+        resultsGrid.innerHTML = '';
+        errorsList.innerHTML = '';
+        allResults = [];
 
         // Show loading
         loadingOverlay.classList.add('visible');
@@ -451,6 +516,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
             // Poll progress
             const taskId = data.task_id;
+            currentTaskId = taskId; // 保存当前任务 ID
             const total = data.total;
             loadingText.textContent = `AI 正在批量生成 ${total} 张广告图...`;
 
@@ -473,15 +539,20 @@ document.addEventListener('DOMContentLoaded', () => {
                 progressText.textContent = `已完成 ${data.completed} / ${total}`;
                 loadingProgress.textContent = `${pct}%`;
 
-                if (data.status === 'done') {
+                if (data.status === 'done' || data.status === 'cancelled') {
                     loadingOverlay.classList.remove('visible');
                     generateBtn.disabled = false;
-                    showResults(data.results, data.errors);
-                    if (data.results.length > 0) {
-                        showToast(`成功生成 ${data.results.length} 张广告图！`, 'success');
-                    }
-                    if (data.errors.length > 0) {
-                        showToast(`${data.errors.length} 张生成失败`, 'error');
+                    currentTaskId = null; // 清空当前任务 ID
+                    if (data.status === 'cancelled') {
+                        showToast('任务已取消', 'error');
+                    } else {
+                        showResults(data.results, data.errors);
+                        if (data.results.length > 0) {
+                            showToast(`成功生成 ${data.results.length} 张广告图！`, 'success');
+                        }
+                        if (data.errors.length > 0) {
+                            showToast(`${data.errors.length} 张生成失败`, 'error');
+                        }
                     }
                     return;
                 }
@@ -513,7 +584,17 @@ document.addEventListener('DOMContentLoaded', () => {
                 </div>
             `;
             item.querySelector('img').addEventListener('click', (e) => openLightbox(e.target.src));
-            item.querySelector('.result-dl-btn').addEventListener('click', () => downloadImage(r.image, r.label));
+            item.querySelector('.result-dl-btn').addEventListener('click', () => {
+                // 获取材质信息
+                let composition = '';
+                if (r.composition) {
+                    composition = r.composition;
+                } else if (r.compositions && r.compositions.length > 0) {
+                    // 组合模式，使用第一个材质或所有材质的组合
+                    composition = r.compositions.join('_');
+                }
+                downloadImage(r.image, r.label, composition);
+            });
             resultsGrid.appendChild(item);
         });
 
@@ -529,15 +610,63 @@ document.addEventListener('DOMContentLoaded', () => {
 
     downloadAllBtn.addEventListener('click', () => {
         allResults.forEach((r, i) => {
-            setTimeout(() => downloadImage(r.image, r.label), i * 300);
+            // 获取材质信息
+            let composition = '';
+            if (r.composition) {
+                composition = r.composition;
+            } else if (r.compositions && r.compositions.length > 0) {
+                composition = r.compositions.join('_');
+            }
+            setTimeout(() => downloadImage(r.image, r.label, composition), i * 300);
         });
     });
 
-    function downloadImage(b64, label) {
-        const link = document.createElement('a');
-        link.href = `data:image/png;base64,${b64}`;
-        link.download = `${label.replace(/[^\w\u4e00-\u9fff.-]/g, '_')}.png`;
-        link.click();
+    async function downloadImage(b64, label, composition = '') {
+        try {
+            // 构建文件名，包含材质信息
+            let filename = label.replace(/[^\w\u4e00-\u9fff.-]/g, '_');
+            if (composition) {
+                // 清理材质名称，使其适合作为文件名
+                const cleanComposition = composition.replace(/[^\w\u4e00-\u9fff.-]/g, '_');
+                filename += `_${cleanComposition}`;
+            }
+            filename += '.png';
+
+            // 转换 base64 为 Blob
+            const response = await fetch(`data:image/png;base64,${b64}`);
+            const blob = await response.blob();
+
+            // 使用 showSaveFilePicker API 让用户选择保存位置
+            const handle = await window.showSaveFilePicker({
+                suggestedName: filename,
+                types: [
+                    { description: 'PNG 图像', accept: { 'image/png': ['.png'] } }
+                ]
+            });
+
+            // 写入文件
+            const writable = await handle.createWritable();
+            await writable.write(blob);
+            await writable.close();
+        } catch (err) {
+            // 如果 API 不支持或用户取消，使用传统下载方式
+            if (err.name === 'AbortError' || err.name === 'NotAllowedError') {
+                // 用户取消或权限不足，使用传统方式
+                const link = document.createElement('a');
+                link.href = `data:image/png;base64,${b64}`;
+                let filename = label.replace(/[^\w\u4e00-\u9fff.-]/g, '_');
+                if (composition) {
+                    const cleanComposition = composition.replace(/[^\w\u4e00-\u9fff.-]/g, '_');
+                    filename += `_${cleanComposition}`;
+                }
+                filename += '.png';
+                link.download = filename;
+                link.click();
+            } else {
+                console.error('下载失败:', err);
+                showToast('下载失败，请重试', 'error');
+            }
+        }
     }
 
     // ==================== Lightbox ====================
@@ -575,54 +704,50 @@ document.addEventListener('DOMContentLoaded', () => {
         return div.innerHTML;
     }
 
+    // ==================== Persistence ====================
+
+    function loadSavedKnives() {
+        const saved = localStorage.getItem('knifead_saved_knives');
+        if (saved) {
+            try {
+                const data = JSON.parse(saved);
+                // Ensure dataUrl is still valid or handle it
+                knifeFiles = data;
+                renderKnifePreviews();
+                updateSummary();
+            } catch (e) {
+                console.error('Failed to load saved knives:', e);
+            }
+        }
+    }
+
+    function saveSavedKnives() {
+        // We only save the metadata and dataUrl (for simplicity in this demo)
+        localStorage.setItem('knifead_saved_knives', JSON.stringify(knifeFiles));
+    }
+
+    // ==================== Cancel Button ====================
+    cancelBtn.addEventListener('click', async () => {
+        if (currentTaskId) {
+            try {
+                const res = await fetch(`/api/task_cancel/${currentTaskId}`, { method: 'POST' });
+                const data = await res.json();
+                if (data.success) {
+                    showToast('取消请求已发送', 'error');
+                } else {
+                    showToast(data.error || '取消失败', 'error');
+                }
+            } catch (e) {
+                showToast(`取消失败: ${e.message}`, 'error');
+            }
+        } else {
+            showToast('没有正在进行的任务', 'error');
+        }
+    });
+
     // ==================== Init ====================
     loadPresets();
+    loadSavedKnives();
     renderCategoryManager();
     updateSummary();
-});
-// ==================== Lightbox & Utils ====================
-
-const lightbox = document.getElementById('lightbox');
-const lightboxImg = document.getElementById('lightbox-img');
-
-function openLightbox(src) {
-    lightboxImg.src = src;
-    lightbox.classList.add('visible');
-}
-
-window.closeLightbox = function () {
-    lightbox.classList.remove('visible');
-};
-
-function showToast(msg, type = 'success') {
-    const toast = document.createElement('div');
-    toast.className = `toast ${type}`;
-    toast.textContent = msg;
-    toastContainer.appendChild(toast);
-    setTimeout(() => toast.classList.add('visible'), 100);
-    setTimeout(() => {
-        toast.classList.remove('visible');
-        setTimeout(() => toast.remove(), 300);
-    }, 3000);
-}
-
-function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
-}
-
-function debounce(func, wait) {
-    let timeout;
-    return function (...args) {
-        clearTimeout(timeout);
-        timeout = setTimeout(() => func.apply(this, args), wait);
-    };
-}
-
-// ==================== Init ====================
-loadPresets();
-loadSavedKnives();
-renderCategoryManager();
-updateSummary();
 });

@@ -2,13 +2,11 @@ import os
 import io
 import time
 import httpx
+import base64
 from PIL import Image
-from google import genai
-from google.genai import types
 from dotenv import load_dotenv
 
 load_dotenv()
-
 
 def get_closest_aspect_ratio(w, h):
     """
@@ -36,38 +34,80 @@ def get_closest_aspect_ratio(w, h):
     return best_match
 
 
-def generate_ad_image(bg_path, knife_path, prompt, output_path, composition="", max_retries=3):
+def _image_to_base64_data_uri(img):
+    buffer = io.BytesIO()
+    # 转为RGB避免透明通道在某些不受支持的模型上报错
+    if img.mode == 'RGBA':
+        background = Image.new('RGB', img.size, (255, 255, 255))
+        background.paste(img, mask=img.split()[3])
+        img = background
+    img.save(buffer, format="JPEG", quality=95)
+    b64 = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("utf-8")
+    return b64
+
+def _call_ark_image_generation(api_key, endpoint_id, prompt, images, max_retries=3):
+    api_url = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
+    }
+    
+    payload = {
+        "model": endpoint_id,
+        "prompt": prompt,
+        "image": images, # Ark多图输入/单图生图通用参数
+        "watermark": False # 官方设置：设为 False 即可关闭左下角的“AI生成”水印
+    }
+    
+    for attempt in range(max_retries):
+        try:
+            print(f">>> [Ark API] 尝试发送求 (尝试 {attempt + 1}/{max_retries})...")
+            response = httpx.post(api_url, headers=headers, json=payload, timeout=60)
+            
+            if response.status_code != 200:
+                raise ValueError(f"Ark API 错误: {response.status_code} - {response.text}")
+                
+            data = response.json()
+            if "data" in data and len(data["data"]) > 0:
+                image_url = data["data"][0].get("url")
+                if image_url:
+                    print(f">>> [Ark API] 生成成功，正在下载图片...")
+                    img_resp = httpx.get(image_url, timeout=30)
+                    if img_resp.status_code == 200:
+                        return img_resp.content
+                    else:
+                        raise ValueError(f"下载生成的图片失败: {img_resp.status_code}")
+                # Some API configs return b64_json
+                image_b64 = data["data"][0].get("b64_json")
+                if image_b64:
+                    return base64.b64decode(image_b64)
+            raise ValueError(f"返回结果中没有图像数据: {data}")
+            
+        except Exception as e:
+            print(f">>> [Ark API] 请求失败: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** (attempt + 1))
+            else:
+                raise e
+    return None
+
+def generate_ad_image(bg_path, knife_path, prompt, output_path, composition="", max_retries=3, cancel_event=None):
     """
-    调用 Google GenAI 接口，直接发送原始背景图 + 刀具图进行 AI 融合生成广告图。
-    不再预先合成/蒙版，让 Gemini 自主完成高质量融合。
-    支持通过 HTTP_PROXY / HTTPS_PROXY 环境变量设置代理。
+    基于火山方舟 Ark 平台，使用 Seedream/Doubao 大模型进行图生图。
     """
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key or api_key == "YOUR_API_KEY_HERE":
-        print(">>> 错误: 请完善 .env 文件中的 GEMINI_API_KEY 配置。")
+    api_key = os.environ.get("ARK_API_KEY")
+    endpoint_id = os.environ.get("ARK_ENDPOINT_ID")
+    
+    if not api_key or not endpoint_id:
+        print(">>> 错误: 请完善 .env 文件中的 ARK_API_KEY 和 ARK_ENDPOINT_ID 配置。")
         return False
 
-    # ---------- 代理支持 ----------
-    proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("https_proxy") or os.environ.get("http_proxy")
-
-    try:
-        if proxy_url:
-            print(f">>> 检测到代理配置: {proxy_url}")
-            http_client = httpx.Client(proxy=proxy_url, timeout=120)
-            client = genai.Client(api_key=api_key, http_options={"client": http_client})
-        else:
-            client = genai.Client(api_key=api_key)
-    except Exception as e:
-        print(f">>> 初始化 Client 失败: {e}")
-        return False
-
-    # ---------- 读取图片 ----------
     try:
         bg_img = Image.open(bg_path).convert("RGB")
         knife_img = Image.open(knife_path).convert("RGBA")
 
-        # 限制图片尺寸，避免请求体过大导致超时
-        max_side = 1536
+        # 限制图片尺寸
+        max_side = 1024
         for label, img in [("bg", bg_img), ("knife", knife_img)]:
             w, h = img.size
             if max(w, h) > max_side:
@@ -82,7 +122,6 @@ def generate_ad_image(bg_path, knife_path, prompt, output_path, composition="", 
         print(f">>> 读取源图失败: {e}")
         return False
 
-    # ---------- 构建 Prompt ----------
     comp_prefix = f"The product knife is made of {composition}. " if composition else ""
     full_prompt = (
         f"{prompt}\n\n"
@@ -91,99 +130,37 @@ def generate_ad_image(bg_path, knife_path, prompt, output_path, composition="", 
         "- Image 1 is the BACKGROUND SCENE.\n"
         "- Image 2 is the PRODUCT KNIFE photograph.\n\n"
         "Generate an ultra-photorealistic advertisement image by placing the knife into the background scene.\n\n"
-        "ABSOLUTE REQUIREMENTS (DO NOT VIOLATE):\n"
-        "1. KNIFE SHAPE PRESERVATION: The knife's exact silhouette, blade shape, handle shape, proportions, "
-        "and every physical detail must be pixel-perfectly preserved from image 2. "
-        "Do NOT alter, reshape, bend, extend, shorten, or modify the knife's form in ANY way. "
-        "The knife in the output must be identical in shape to image 2.\n"
-        "2. LOGO PRESERVATION: Any text, logo, brand mark, or engraving visible on the knife blade "
-        "in image 2 must be reproduced EXACTLY as-is — same text, same font, same position, same size, same orientation. "
-        "Do NOT change, remove, or re-interpret the logo.\n"
-        "3. Only modify the BACKGROUND and add natural lighting, shadows, and reflections to integrate "
-        "the knife into the scene. The knife itself is sacred and untouchable.\n\n"
-        "The final result should look like a high-end professional product photograph."
     )
 
-    # 使用当前可用的图像生成模型
-    model_id = "gemini-3-pro-image-preview"
-
-    # ---------- API 调用（带重试） ----------
-    for attempt in range(max_retries):
-        try:
-            print(f">>> [API 通信] 开始请求 (第 {attempt + 1}/{max_retries} 次尝试)...")
-
-            # 计算最适合的输出比例
-            target_ratio = get_closest_aspect_ratio(bg_img.width, bg_img.height)
-
-            response = client.models.generate_content(
-                model=model_id,
-                contents=[bg_img, knife_img, full_prompt],
-                config=types.GenerateContentConfig(
-                    response_modalities=["IMAGE", "TEXT"],
-                    image_config=types.ImageConfig(
-                        aspect_ratio=target_ratio
-                    )
-                )
-            )
-
-            # 提取返回的图像
-            result_image = None
-            if response.candidates:
-                for part in response.candidates[0].content.parts:
-                    if part.inline_data is not None:
-                        image_bytes = part.inline_data.data
-                        result_image = Image.open(io.BytesIO(image_bytes))
-                        break
-
-            if result_image is None:
-                text_resp = ""
-                try:
-                    text_resp = response.text[:200]
-                except Exception:
-                    pass
-                raise ValueError(f"API 未返回图像数据。文字回复: {text_resp}")
-
+    bg_b64 = _image_to_base64_data_uri(bg_img)
+    knife_b64 = _image_to_base64_data_uri(knife_img)
+    
+    try:
+        if cancel_event and cancel_event.is_set():
+            return False
+        
+        image_bytes = _call_ark_image_generation(api_key, endpoint_id, full_prompt, [bg_b64, knife_b64], max_retries=max_retries)
+        if image_bytes:
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            result_image.save(output_path, quality=95)
-
+            with open(output_path, "wb") as f:
+                f.write(image_bytes)
             print(f">>> [成功] API 渲染完毕，最终文件已存至 -> {output_path}")
             return True
-
-        except Exception as e:
-            print(f">>> [API 异常] 第 {attempt + 1} 次请求失败，原因: {e}")
-            if attempt < max_retries - 1:
-                wait = 2 ** (attempt + 1)
-                print(f">>> 等待 {wait} 秒后重试...")
-                time.sleep(wait)
-            else:
-                print(">>> [严重错误] API 重试次数已达上限，跳过该文件的渲染。")
-                return False
-
+    except Exception as e:
+        print(f">>> [API 异常] 最终失败: {e}")
+        
     return False
 
-
-def generate_ad_image_bytes(bg_img, knife_img, prompt, composition="", max_retries=3):
+def generate_ad_image_bytes(bg_img, knife_img, prompt, composition="", max_retries=3, cancel_event=None):
     """
-    Web API 专用：接收 PIL Image 对象，返回生成图片的字节流。
-    成功返回 (True, image_bytes)，失败返回 (False, error_message)。
+    Web API 专用版本
     """
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key or api_key == "YOUR_API_KEY_HERE":
-        return False, "请配置 GEMINI_API_KEY"
+    api_key = os.environ.get("ARK_API_KEY")
+    endpoint_id = os.environ.get("ARK_ENDPOINT_ID")
+    if not api_key or not endpoint_id:
+        return False, "请配置 ARK_API_KEY 和 ARK_ENDPOINT_ID (前往火山方舟控制台获取)"
 
-    proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("https_proxy") or os.environ.get("http_proxy")
-
-    try:
-        if proxy_url:
-            http_client = httpx.Client(proxy=proxy_url, timeout=120)
-            client = genai.Client(api_key=api_key, http_options={"client": http_client})
-        else:
-            client = genai.Client(api_key=api_key)
-    except Exception as e:
-        return False, f"初始化 Client 失败: {e}"
-
-    # 限制图片尺寸
-    max_side = 1536
+    max_side = 1024
     for label, img in [("bg", bg_img), ("knife", knife_img)]:
         w, h = img.size
         if max(w, h) > max_side:
@@ -202,54 +179,77 @@ def generate_ad_image_bytes(bg_img, knife_img, prompt, composition="", max_retri
         "- Image 1 is the BACKGROUND SCENE.\n"
         "- Image 2 is the PRODUCT KNIFE photograph.\n\n"
         "Generate an ultra-photorealistic advertisement image by placing the knife into the background scene.\n\n"
-        "ABSOLUTE REQUIREMENTS (DO NOT VIOLATE):\n"
-        "1. KNIFE SHAPE PRESERVATION: The knife's exact silhouette, blade shape, handle shape, proportions, "
-        "and every physical detail must be pixel-perfectly preserved from image 2. "
-        "Do NOT alter, reshape, bend, extend, shorten, or modify the knife's form in ANY way. "
-        "The knife in the output must be identical in shape to image 2.\n"
-        "2. LOGO PRESERVATION: Any text, logo, brand mark, or engraving visible on the knife blade "
-        "in image 2 must be reproduced EXACTLY as-is — same text, same font, same position, same size, same orientation. "
-        "Do NOT change, remove, or re-interpret the logo.\n"
-        "3. Only modify the BACKGROUND and add natural lighting, shadows, and reflections to integrate "
-        "the knife into the scene. The knife itself is sacred and untouchable.\n\n"
-        "The final result should look like a high-end professional product photograph."
     )
 
-    model_id = "gemini-3-pro-image-preview"
+    bg_b64 = _image_to_base64_data_uri(bg_img)
+    knife_b64 = _image_to_base64_data_uri(knife_img)
+    
+    if cancel_event and cancel_event.is_set():
+        return False, "任务已被取消"
 
-    # 计算最适合的输出比例
-    target_ratio = get_closest_aspect_ratio(bg_img.width, bg_img.height)
+    try:
+        image_bytes = _call_ark_image_generation(api_key, endpoint_id, full_prompt, [bg_b64, knife_b64], max_retries=max_retries)
+        if image_bytes:
+            return True, image_bytes
+        else:
+            return False, "返回空结果"
+    except Exception as e:
+        return False, f"Ark API 异常: {e}"
 
-    for attempt in range(max_retries):
-        try:
-            response = client.models.generate_content(
-                model=model_id,
-                contents=[bg_img, knife_img, full_prompt],
-                config=types.GenerateContentConfig(
-                    response_modalities=["IMAGE", "TEXT"],
-                    image_config=types.ImageConfig(
-                        aspect_ratio=target_ratio
-                    )
-                )
-            )
+def generate_ad_image_bytes_combo(bg_img, knife_imgs, prompt, compositions=[], max_retries=3, cancel_event=None):
+    """
+    组合模式 Web API 版本
+    """
+    api_key = os.environ.get("ARK_API_KEY")
+    endpoint_id = os.environ.get("ARK_ENDPOINT_ID")
+    if not api_key or not endpoint_id:
+        return False, "请配置 ARK_API_KEY 和 ARK_ENDPOINT_ID (前往火山方舟控制台获取)"
 
-            if response.candidates:
-                for part in response.candidates[0].content.parts:
-                    if part.inline_data is not None:
-                        image_bytes = part.inline_data.data
-                        return True, image_bytes
+    max_side = 1024
+    w, h = bg_img.size
+    if max(w, h) > max_side:
+        ratio = max_side / max(w, h)
+        bg_img = bg_img.resize((int(w * ratio), int(h * ratio)), Image.Resampling.LANCZOS)
+        
+    resized_knife_imgs = []
+    for knife_img in knife_imgs:
+        w, h = knife_img.size
+        if max(w, h) > max_side:
+            ratio = max_side / max(w, h)
+            resized_knife_imgs.append(knife_img.resize((int(w * ratio), int(h * ratio)), Image.Resampling.LANCZOS))
+        else:
+            resized_knife_imgs.append(knife_img)
 
-            text_resp = ""
-            try:
-                text_resp = response.text[:200]
-            except Exception:
-                pass
-            raise ValueError(f"API 未返回图像数据。文字回复: {text_resp}")
+    knife_descriptions = []
+    for i, composition in enumerate(compositions):
+        if composition:
+            knife_descriptions.append(f"Knife {i+1} is made of {composition}.")
+        else:
+            knife_descriptions.append(f"Knife {i+1}.")
+    comp_prefix = " ".join(knife_descriptions) + " " if knife_descriptions else ""
 
-        except Exception as e:
-            if attempt < max_retries - 1:
-                time.sleep(2 ** (attempt + 1))
-            else:
-                return False, f"API 调用失败: {e}"
+    instructions = "CRITICAL INSTRUCTIONS:\n- Image 1 is the BACKGROUND SCENE.\n"
+    for i in range(len(resized_knife_imgs)):
+        instructions += f"- Image {i+2} is a PRODUCT KNIFE referenced photograph.\n"
+    
+    full_prompt = (
+        f"{prompt}\n\n"
+        f"PRODUCT DESCRIPTION: {comp_prefix}All knives should be realistically rendered and integrated into the scene.\n\n"
+        f"{instructions}\n"
+        f"Generate an ultra-photorealistic advertisement image by placing all knives into the background scene."
+    )
 
-    return False, "未知错误"
+    all_images = [bg_img] + resized_knife_imgs
+    b64_list = [_image_to_base64_data_uri(img) for img in all_images]
+    
+    if cancel_event and cancel_event.is_set():
+        return False, "任务已被取消"
+
+    try:
+        image_bytes = _call_ark_image_generation(api_key, endpoint_id, full_prompt, b64_list, max_retries=max_retries)
+        if image_bytes:
+            return True, image_bytes
+        else:
+            return False, "返回空结果"
+    except Exception as e:
+        return False, f"Ark API 异常: {e}"
